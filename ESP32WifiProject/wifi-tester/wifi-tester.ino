@@ -1,14 +1,14 @@
-// ESP32 WiFi Tester - Step 5: real WiFi scan feeding the menu architecture
+// ESP32 WiFi Tester - Step 6: Live Signal screen
 //
 // Navigation tree:
 //   MENU
 //   └─ WiFi Scanner -> NETWORKS (names as broadcast, "(n)" marker if names collide)
 //        └─ [network] -> DETAILS (full name, BSSID, channel, signal)
 //             └─ OPTIONS
-//                  ├─ Live Signal
+//                  ├─ Live Signal   (dBm, grade, bar graph - updates continuously)
 //                  ├─ Channel & Congestion
 //                  ├─ Latency
-//                  └─ Activity      (each is a placeholder for now)
+//                  └─ Activity      (Channel, Latency and Activity are placeholders for now)
 //
 // Controls:
 //   UP / DOWN         : move the highlight (wraps around)
@@ -46,6 +46,8 @@ const uint8_t PIN_SELECT = 27;
 enum ButtonEvent { EVT_NONE, EVT_UP, EVT_DOWN, EVT_SELECT, EVT_BACK };
 
 typedef const char* (*LabelFn)(int);   // returns the text for list row i
+
+enum ScanKind { SCAN_NONE, SCAN_LIST, SCAN_LIVE };   // which WiFi scan is running
 
 enum Screen {
   SCREEN_MENU,
@@ -100,7 +102,8 @@ const int MAX_NETS = 40;   // the 40 strongest networks are kept
 
 Net  nets[MAX_NETS];
 int  netCount = 0;
-bool scanning = false;          // true while a scan is running
+ScanKind scanKind     = SCAN_NONE;   // which scan is running right now
+bool     wantListScan = false;       // a list scan was asked for and starts when the radio is free
 
 char netLabels[MAX_NETS][24];   // list text: name, plus " (n)" if the name appears more than once
 int  netOrder[MAX_NETS];        // this network's position among same-name networks (1, 2, ...)
@@ -110,6 +113,9 @@ Net  selectedNet;
 char selectedLabel[24] = "";
 int  selectedOrder = 1;
 int  selectedTotal = 1;
+
+float liveRssi  = -100;   // smoothed signal shown on the Live Signal screen
+int   missCount = 0;      // consecutive live scans that did not see the chosen network
 
 // Text to show for a network's name. The name is used exactly as broadcast;
 // characters the OLED font can't draw (emoji, accents) show as '?'.
@@ -149,26 +155,47 @@ void buildNetLabels() {
 }
 
 // ---------- Scanning ----------
-// Starts a background scan (the buttons keep working while it runs).
+// Only one scan runs at a time. pumpScan() (called from loop) collects the
+// finished scan, then starts whichever is wanted next: the full list scan
+// (when you open WiFi Scanner) or, while Live Signal is open, repeated scans
+// of just the chosen network's channel.
+
+const uint32_t LIVE_DWELL_MS   = 200;    // time spent listening on the channel per live scan
+const float    SMOOTH_ALPHA    = 0.5f;   // 1.0 = raw readings, lower = smoother
+const int      LIVE_MISS_LIMIT = 4;      // scans in a row without a sighting before "No signal"
+
+bool listScanBusy() { return wantListScan || scanKind == SCAN_LIST; }
+
+// Called when the list is opened: clears the list and asks for a fresh scan
 void startScan() {
   netCount = 0;
   netState.cursor = 0;
   netState.scroll = 0;
-
-  if (!scanning) {                     // if one is still running (you left and came back), just wait for it
-    WiFi.scanDelete();                 // clear old results
-    WiFi.scanNetworks(true, true);     // async = true, include hidden networks
-    scanning = true;
-  }
+  wantListScan = true;
 }
 
-// Call from loop(). Returns true when a scan has just finished.
-// Keeps the strongest MAX_NETS networks, sorted strongest first.
-bool checkScan() {
-  int n = WiFi.scanComplete();
-  if (n == WIFI_SCAN_RUNNING) return false;
+// Called when Live Signal is opened
+void resetLive() {
+  liveRssi  = selectedNet.rssi;   // start from the value seen in the list
+  missCount = 0;
+}
 
-  scanning = false;
+void beginListScan() {
+  wantListScan = false;
+  WiFi.scanDelete();               // clear old results
+  WiFi.scanNetworks(true, true);   // async, include hidden networks
+  scanKind = SCAN_LIST;
+}
+
+void beginLiveScan() {
+  WiFi.scanDelete();
+  // async, include hidden, active scan, LIVE_DWELL_MS on the channel, only the chosen channel
+  WiFi.scanNetworks(true, true, false, LIVE_DWELL_MS, selectedNet.channel);
+  scanKind = SCAN_LIVE;
+}
+
+// Keeps the strongest MAX_NETS networks, sorted strongest first.
+void processListScan(int n) {
   netCount = 0;
 
   for (int i = 0; i < n; i++) {        // n is negative if the scan failed, so this is skipped
@@ -204,7 +231,48 @@ bool checkScan() {
     Serial.print(" dBm  ch ");
     Serial.println(nets[i].channel);
   }
-  return true;
+}
+
+// Looks for the chosen access point (matched by BSSID) in a channel scan
+void processLiveScan(int n) {
+  bool found = false;
+
+  for (int i = 0; i < n; i++) {        // n is negative if the scan failed, so this is skipped
+    if (memcmp(WiFi.BSSID(i), selectedNet.bssid, 6) == 0) {
+      float r = WiFi.RSSI(i);
+      if (missCount >= LIVE_MISS_LIMIT) liveRssi = r;             // was lost: jump straight to the new reading
+      else liveRssi += SMOOTH_ALPHA * (r - liveRssi);             // otherwise smooth
+      missCount = 0;
+      found = true;
+      break;
+    }
+  }
+
+  if (!found && missCount < 100) missCount++;
+  WiFi.scanDelete();
+}
+
+// Call from loop(). Returns true when the screen needs a redraw.
+bool pumpScan() {
+  if (scanKind != SCAN_NONE) {
+    int n = WiFi.scanComplete();
+    if (n == WIFI_SCAN_RUNNING) return false;
+
+    ScanKind finished = scanKind;
+    scanKind = SCAN_NONE;
+
+    if (finished == SCAN_LIST) {
+      processListScan(n);
+      return currentScreen == SCREEN_NETWORKS;
+    }
+    processLiveScan(n);
+    return currentScreen == SCREEN_LIVE;
+  }
+
+  // Nothing running: start whatever is wanted
+  if (wantListScan) beginListScan();
+  else if (currentScreen == SCREEN_LIVE) beginLiveScan();
+  return false;
 }
 
 // ---------- Button events ----------
@@ -356,6 +424,75 @@ void drawDetails() {
   display.display();
 }
 
+// ---------- Live Signal screen ----------
+// Big dBm value, a grade, and a bar graph. The bar runs from SCALE_MIN (empty,
+// left) to SCALE_MAX (full, right); divider lines mark the grade boundaries.
+const int SCALE_MIN = -100;
+const int SCALE_MAX = 0;
+const int DIVIDERS[4] = {-80, -70, -60, -30};   // poor|spotty, spotty|good, good|excellent, top of excellent
+
+const int BAR_X = 4;
+const int BAR_W = 120;
+const int BAR_Y = 44;
+const int BAR_H = 12;
+
+const char* gradeFor(int dbm) {
+  if (dbm >= -60) return "Excellent";   // -30 to -60 (and anything stronger)
+  if (dbm >= -70) return "Good";        // -60 to -70
+  if (dbm >= -80) return "Spotty";      // -70 to -80
+  return "Poor";                        // weaker than -80
+}
+
+// x position on the bar for a dBm value
+int barX(int dbm) {
+  if (dbm < SCALE_MIN) dbm = SCALE_MIN;
+  if (dbm > SCALE_MAX) dbm = SCALE_MAX;
+  return BAR_X + (dbm - SCALE_MIN) * BAR_W / (SCALE_MAX - SCALE_MIN);
+}
+
+void drawLive() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  // Header (yellow): which network
+  display.setTextSize(1);
+  display.setCursor(0, 4);
+  display.print(selectedLabel);
+
+  bool lost = (missCount >= LIVE_MISS_LIMIT);
+  int dbm = (int)lroundf(liveRssi);
+
+  // Big dBm number
+  char num[8];
+  if (lost) snprintf(num, sizeof(num), "--");
+  else      snprintf(num, sizeof(num), "%d", dbm);
+
+  display.setTextSize(2);
+  display.setCursor(0, 18);
+  display.print(num);
+
+  // "dBm" after the number, and the grade at the right edge (small text, bottom-aligned)
+  display.setTextSize(1);
+  display.setCursor((int)strlen(num) * 12 + 4, 26);
+  display.print("dBm");
+
+  const char* grade = lost ? "No signal" : gradeFor(dbm);
+  display.setCursor(SCREEN_WIDTH - (int)strlen(grade) * 6, 26);
+  display.print(grade);
+
+  // Bar: frame (its left and right edges are the base and the max), then the fill
+  int fillEnd = lost ? BAR_X : barX(dbm);
+  display.drawRect(BAR_X, BAR_Y, BAR_W + 1, BAR_H, SSD1306_WHITE);
+  display.fillRect(BAR_X, BAR_Y, fillEnd - BAR_X + 1, BAR_H, SSD1306_WHITE);
+
+  // Grade dividers: drawn inverted, so they show dark on the fill and light on the empty part
+  for (int i = 0; i < 4; i++) {
+    display.drawFastVLine(barX(DIVIDERS[i]), BAR_Y - 3, BAR_H + 6, SSD1306_INVERSE);
+  }
+
+  display.display();
+}
+
 void drawToolPlaceholder(const char* title) {
   display.clearDisplay();
   display.setTextSize(1);
@@ -387,7 +524,7 @@ void draw() {
       drawList("MENU", MENU_COUNT, menuState, menuLabel, "Nothing here");
       break;
     case SCREEN_NETWORKS:
-      if (scanning) {
+      if (listScanBusy()) {
         drawList("Scanning...", 0, netState, netLabel, "Please wait");
       } else {
         snprintf(header, sizeof(header), "Networks: %d", netCount);
@@ -400,7 +537,7 @@ void draw() {
     case SCREEN_OPTIONS:
       drawList(selectedLabel, OPTION_COUNT, optState, optionLabel, "Nothing here");
       break;
-    case SCREEN_LIVE:     drawToolPlaceholder(OPTION_ITEMS[0]); break;
+    case SCREEN_LIVE:     drawLive(); break;
     case SCREEN_CHANNEL:  drawToolPlaceholder(OPTION_ITEMS[1]); break;
     case SCREEN_LATENCY:  drawToolPlaceholder(OPTION_ITEMS[2]); break;
     case SCREEN_ACTIVITY: drawToolPlaceholder(OPTION_ITEMS[3]); break;
@@ -451,7 +588,10 @@ void handleEvent(ButtonEvent evt) {
     case SCREEN_OPTIONS:
       if (evt == EVT_UP)     moveList(optState, OPTION_COUNT, -1);
       if (evt == EVT_DOWN)   moveList(optState, OPTION_COUNT, +1);
-      if (evt == EVT_SELECT) currentScreen = OPTION_TARGETS[optState.cursor];
+      if (evt == EVT_SELECT) {
+        currentScreen = OPTION_TARGETS[optState.cursor];
+        if (currentScreen == SCREEN_LIVE) resetLive();
+      }
       if (evt == EVT_BACK)   currentScreen = SCREEN_DETAILS;
       break;
 
@@ -465,6 +605,7 @@ void handleEvent(ButtonEvent evt) {
 void setup() {
   Serial.begin(115200);
   Wire.begin(PIN_SDA, PIN_SCL);
+  Wire.setClock(400000);   // faster display updates
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
     Serial.println("SSD1306 not found - check wiring and address");
@@ -483,6 +624,6 @@ void loop() {
   ButtonEvent evt = readButtons();
   if (evt != EVT_NONE) handleEvent(evt);
 
-  // The scan runs in the background; redraw the list when the results arrive
-  if (scanning && checkScan() && currentScreen == SCREEN_NETWORKS) draw();
+  // Scans run in the background; redraw when new results arrive
+  if (pumpScan()) draw();
 }
