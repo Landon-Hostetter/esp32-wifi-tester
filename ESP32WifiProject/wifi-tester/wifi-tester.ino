@@ -1,4 +1,4 @@
-// ESP32 WiFi Tester - Step 7: Channel & Congestion screen, rescan
+// ESP32 WiFi Tester - Step 8: Latency screen
 //
 // Navigation tree:
 //   MENU
@@ -24,6 +24,7 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
+#include "ping/ping_sock.h"
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
@@ -71,6 +72,7 @@ struct Net {
   int32_t rssi;
   uint8_t channel;
   uint8_t bssid[6];   // unique hardware address: how networks are told apart internally
+  wifi_auth_mode_t auth; // encryption/authentication type reported by the scan
 };
 
 struct Bucket {          // one second of sniffed traffic
@@ -123,6 +125,30 @@ int  selectedTotal = 1;
 
 float liveRssi  = -100;   // smoothed signal shown on the Live Signal screen
 int   missCount = 0;      // consecutive live scans that did not see the chosen network
+
+// ---------- Latency state ----------
+enum LatencyState {
+  LATENCY_IDLE,
+  LATENCY_CONNECTING,
+  LATENCY_PINGING,
+  LATENCY_RESULT,
+  LATENCY_FAILED,
+  LATENCY_PING_FAILED
+};
+
+LatencyState latencyState = LATENCY_IDLE;
+char latencyReason[40] = "";
+uint32_t latencyMs = 0;
+bool latencyHasPing = false;
+
+// Ping configuration: five ICMP echo requests to Google's public DNS.
+const int LATENCY_PING_COUNT = 5;
+const uint32_t LATENCY_CONNECT_TIMEOUT_MS = 15000;
+const uint32_t LATENCY_PING_TIMEOUT_MS = 1500;
+
+volatile bool pingDone = false;
+volatile uint32_t pingSumMs = 0;
+volatile uint32_t pingReplies = 0;
 
 // ---------- Channel & Congestion (sniffer) state ----------
 const int      SNIFF_WINDOW_S    = 5;                    // seconds of traffic behind each reading
@@ -249,6 +275,7 @@ void processListScan(int n) {
     nets[pos].rssi    = rssi;
     nets[pos].channel = WiFi.channel(i);
     memcpy(nets[pos].bssid, WiFi.BSSID(i), 6);
+    nets[pos].auth    = WiFi.encryptionType(i);
     if (netCount < MAX_NETS) netCount++;
   }
 
@@ -834,6 +861,235 @@ void drawNoNetworks() {
   display.display();
 }
 
+// ---------- Latency ----------
+
+const char* latencyGrade(uint32_t ms) {
+  if (ms < 30)  return "Fast";
+  if (ms < 60)  return "Good";
+  if (ms < 100) return "Moderate";
+  return "Poor";
+}
+
+const char* wifiStatusReason(wl_status_t status) {
+  switch (status) {
+    case WL_NO_SSID_AVAIL: return "Network not found";
+    case WL_CONNECT_FAILED: return "Connection failed";
+    case WL_CONNECTION_LOST: return "Connection lost";
+    case WL_DISCONNECTED: return "Disconnected";
+    default: return "Unknown error";
+  }
+}
+
+// Native ESP-IDF ping callback. It runs in the ping task, so only update
+// small volatile values here.
+void latencyPingSuccess(esp_ping_handle_t hdl, void *args) {
+  uint32_t elapsed = 0;
+  esp_ping_get_profile(hdl, ESP_PING_PROF_TIMEGAP, &elapsed, sizeof(elapsed));
+  pingSumMs += elapsed;
+  pingReplies++;
+}
+
+void latencyPingTimeout(esp_ping_handle_t hdl, void *args) {
+  // A timeout is simply an unanswered ping. The final result uses the
+  // successful replies; if there are none, the screen reports failure.
+}
+
+void latencyPingEnd(esp_ping_handle_t hdl, void *args) {
+  pingDone = true;
+}
+
+bool runLatencyPing() {
+  pingDone = false;
+  pingSumMs = 0;
+  pingReplies = 0;
+
+  esp_ping_config_t config = ESP_PING_DEFAULT_CONFIG();
+  // ESP32 Arduino core 3.x uses the newer lwIP ip_addr_t union layout.
+  config.target_addr.type = IPADDR_TYPE_V4;
+  config.target_addr.u_addr.ip4.addr = (uint32_t)IPAddress(8, 8, 8, 8);
+  config.count = LATENCY_PING_COUNT;
+  config.timeout_ms = LATENCY_PING_TIMEOUT_MS;
+
+  esp_ping_callbacks_t callbacks = {};
+  callbacks.on_ping_success = latencyPingSuccess;
+  callbacks.on_ping_timeout = latencyPingTimeout;
+  callbacks.on_ping_end = latencyPingEnd;
+  callbacks.cb_args = nullptr;
+
+  esp_ping_handle_t ping = nullptr;
+  if (esp_ping_new_session(&config, &callbacks, &ping) != ESP_OK) {
+    return false;
+  }
+
+  if (esp_ping_start(ping) != ESP_OK) {
+    esp_ping_delete_session(ping);
+    return false;
+  }
+
+  while (!pingDone) {
+    delay(10);
+  }
+
+  esp_ping_delete_session(ping);
+
+  if (pingReplies == 0) {
+    return false;
+  }
+
+  latencyMs = (uint32_t)((pingSumMs + pingReplies / 2) / pingReplies);
+  latencyHasPing = true;
+  return true;
+}
+
+void drawLatency() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  display.setCursor(0, 4);
+  display.print("Latency");
+
+  if (latencyState == LATENCY_CONNECTING) {
+    display.setCursor(0, 22);
+    display.print("Joining network...");
+    display.setCursor(0, 38);
+    display.print(selectedLabel);
+    display.setCursor(0, 54);
+    display.print("Please wait");
+  } else if (latencyState == LATENCY_PINGING) {
+    display.setCursor(0, 22);
+    display.print("Pinging 8.8.8.8...");
+    display.setCursor(0, 38);
+    display.print("Testing latency");
+    display.setCursor(0, 54);
+    display.print("Please wait");
+  } else if (latencyState == LATENCY_FAILED) {
+    display.setCursor(0, 18);
+    display.print("Cannot join network");
+
+    // Wrap the reason over two lines if necessary.
+    char line[22];
+    snprintf(line, sizeof(line), "%.21s", latencyReason);
+    display.setCursor(0, 31);
+    display.print(line);
+    if (strlen(latencyReason) > 21) {
+      display.setCursor(0, 42);
+      display.print(latencyReason + 21);
+    }
+
+    display.setCursor(0, 55);
+    display.print("SELECT: return");
+  } else if (latencyState == LATENCY_PING_FAILED) {
+    display.setCursor(0, 18);
+    display.print("Ping failed");
+
+    char line[22];
+    snprintf(line, sizeof(line), "%.21s", latencyReason);
+    display.setCursor(0, 31);
+    display.print(line);
+    if (strlen(latencyReason) > 21) {
+      display.setCursor(0, 42);
+      display.print(latencyReason + 21);
+    }
+
+    display.setCursor(0, 55);
+    display.print("SELECT: return");
+  } else if (latencyState == LATENCY_RESULT && latencyHasPing) {
+    char line[24];
+
+    display.setCursor(0, 18);
+    display.print("Ping 8.8.8.8");
+
+    display.setTextSize(2);
+    snprintf(line, sizeof(line), "%lu ms", (unsigned long)latencyMs);
+    display.setCursor(0, 29);
+    display.print(line);
+
+    display.setTextSize(1);
+    const char* grade = latencyGrade(latencyMs);
+    display.setCursor(SCREEN_WIDTH - (int)strlen(grade) * 6, 32);
+    display.print(grade);
+
+    display.setCursor(0, 55);
+    display.print("Hold SELECT: back");
+  } else {
+    display.setCursor(0, 24);
+    display.print("Starting...");
+  }
+
+  display.display();
+}
+
+// Begin the latency test. The selected network is the exact AP chosen on
+// the Details screen (SSID + BSSID + channel).
+void startLatency() {
+  latencyState = LATENCY_CONNECTING;
+  latencyHasPing = false;
+  latencyMs = 0;
+  latencyReason[0] = '\0';
+  drawLatency();
+
+  // The current project intentionally does not store passwords. We can join
+  // open networks directly; secured networks need credentials that the
+  // current UI does not have.
+  if (selectedNet.ssid[0] == '\0') {
+    snprintf(latencyReason, sizeof(latencyReason), "Network name is hidden");
+    latencyState = LATENCY_FAILED;
+    drawLatency();
+    return;
+  }
+
+  if (selectedNet.auth != WIFI_AUTH_OPEN) {
+    snprintf(latencyReason, sizeof(latencyReason), "Password required");
+    latencyState = LATENCY_FAILED;
+    drawLatency();
+    return;
+  }
+
+  // Stop any scan/sniffer activity and connect specifically to this BSSID.
+  WiFi.scanDelete();
+  esp_wifi_set_promiscuous(false);
+  sniffing = false;
+  WiFi.disconnect(false, false);
+  delay(100);
+
+  WiFi.begin(selectedNet.ssid, nullptr, selectedNet.channel, selectedNet.bssid, true);
+
+  unsigned long deadline = millis() + LATENCY_CONNECT_TIMEOUT_MS;
+  while (WiFi.status() != WL_CONNECTED && millis() < deadline) {
+    delay(100);
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    snprintf(latencyReason, sizeof(latencyReason), "%s", wifiStatusReason(WiFi.status()));
+    latencyState = LATENCY_FAILED;
+    drawLatency();
+    return;
+  }
+
+  latencyState = LATENCY_PINGING;
+  drawLatency();
+
+  if (!runLatencyPing()) {
+    snprintf(latencyReason, sizeof(latencyReason), "8.8.8.8 did not reply");
+    latencyState = LATENCY_PING_FAILED;
+    drawLatency();
+    return;
+  }
+
+  latencyState = LATENCY_RESULT;
+  drawLatency();
+}
+
+void stopLatency() {
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFi.disconnect(false, false);
+    delay(100);
+  }
+  latencyState = LATENCY_IDLE;
+  latencyHasPing = false;
+}
+
 void drawToolPlaceholder(const char* title) {
   display.clearDisplay();
   display.setTextSize(1);
@@ -882,7 +1138,7 @@ void draw() {
       break;
     case SCREEN_LIVE:     drawLive(); break;
     case SCREEN_CHANNEL:  drawChannel(); break;
-    case SCREEN_LATENCY:  drawToolPlaceholder(OPTION_ITEMS[2]); break;
+    case SCREEN_LATENCY:  drawLatency(); break;
     case SCREEN_ACTIVITY: drawToolPlaceholder(OPTION_ITEMS[3]); break;
   }
 }
@@ -938,6 +1194,7 @@ void handleEvent(ButtonEvent evt) {
         currentScreen = OPTION_TARGETS[optState.cursor];
         if (currentScreen == SCREEN_LIVE) resetLive();
         if (currentScreen == SCREEN_CHANNEL) resetSniffStats();
+        if (currentScreen == SCREEN_LATENCY) startLatency();
       }
       if (evt == EVT_BACK)   currentScreen = SCREEN_DETAILS;
       break;
@@ -947,6 +1204,17 @@ void handleEvent(ButtonEvent evt) {
       if (evt == EVT_DOWN) moveListRows(devState, devSnapCount, +1, CH_VISIBLE);
       if (evt == EVT_BACK) {
         stopSniff();
+        currentScreen = SCREEN_OPTIONS;
+      }
+      break;
+
+    case SCREEN_LATENCY:
+      // On a failed connection, a short SELECT returns as requested.
+      if ((latencyState == LATENCY_FAILED || latencyState == LATENCY_PING_FAILED) && evt == EVT_SELECT) {
+        stopLatency();
+        currentScreen = SCREEN_OPTIONS;
+      } else if (evt == EVT_BACK) {
+        stopLatency();
         currentScreen = SCREEN_OPTIONS;
       }
       break;
