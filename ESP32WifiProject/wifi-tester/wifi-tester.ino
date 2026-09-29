@@ -85,20 +85,24 @@ void drawMenu() {
   display.clearDisplay();
   display.setTextSize(1);
 
+  // Two-color panel: rows 0-15 are yellow (header only),
+  // rows 16-63 are blue (menu items). Nothing straddles the boundary.
+  const int BLUE_TOP = 16;
+  const int ROW_H = 12;
+
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
+  display.setCursor(0, 4);
   display.print("MENU");
-  display.drawFastHLine(0, 10, SCREEN_WIDTH, SSD1306_WHITE);
 
   for (int i = 0; i < MENU_COUNT; i++) {
-    int y = 14 + i * 12;
+    int rowTop = BLUE_TOP + i * ROW_H;     // 16, 28, 40, 52
     if (i == menuIndex) {
-      display.fillRect(0, y - 2, SCREEN_WIDTH, 12, SSD1306_WHITE);
+      display.fillRect(0, rowTop, SCREEN_WIDTH, ROW_H, SSD1306_WHITE);
       display.setTextColor(SSD1306_BLACK);
     } else {
       display.setTextColor(SSD1306_WHITE);
     }
-    display.setCursor(4, y);
+    display.setCursor(4, rowTop + 2);
     display.print(MENU_ITEMS[i]);
   }
   display.display();
@@ -109,9 +113,8 @@ void drawPlaceholder(const char* title) {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
-  display.setCursor(0, 0);
+  display.setCursor(0, 4);
   display.print(title);
-  display.drawFastHLine(0, 10, SCREEN_WIDTH, SSD1306_WHITE);
 
   display.setCursor(0, 24);
   display.print("Coming soon");
