@@ -1,4 +1,4 @@
-// ESP32 WiFi Tester - Step 4 (v2): menu architecture with network details
+// ESP32 WiFi Tester - Step 5: real WiFi scan feeding the menu architecture
 //
 // Navigation tree:
 //   MENU
@@ -15,13 +15,14 @@
 //   SELECT (short)    : open the highlighted item / continue
 //   SELECT (hold 1 s) : go back one level
 //
-// The network list uses TEST DATA (no WiFi code yet). It will be replaced
-// by real scan results in the scanner step.
+// The network list comes from a real 2.4 GHz WiFi scan, strongest signal first.
+// A new scan starts each time you open WiFi Scanner from the menu.
 //
 // Layout for the two-color OLED: rows 0-15 are yellow (header only),
 // rows 16-63 are blue (lists and graphs).
 
 #include <Wire.h>
+#include <WiFi.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
@@ -95,10 +96,11 @@ ListState netState  = {0, 0};
 ListState optState  = {0, 0};
 
 // ---------- Networks ----------
-const int MAX_NETS = 20;
+const int MAX_NETS = 40;   // the 40 strongest networks are kept
 
 Net  nets[MAX_NETS];
 int  netCount = 0;
+bool scanning = false;          // true while a scan is running
 
 char netLabels[MAX_NETS][24];   // list text: name, plus " (n)" if the name appears more than once
 int  netOrder[MAX_NETS];        // this network's position among same-name networks (1, 2, ...)
@@ -108,31 +110,6 @@ Net  selectedNet;
 char selectedLabel[24] = "";
 int  selectedOrder = 1;
 int  selectedTotal = 1;
-
-// TEST DATA: a mesh pair with the same name, two hidden networks (empty name
-// on the air), and a maximum-length 32-character name.
-void addTestNet(const char* ssid, int rssi, uint8_t channel, uint8_t id) {
-  if (netCount >= MAX_NETS) return;
-  Net &n = nets[netCount++];
-  strncpy(n.ssid, ssid, sizeof(n.ssid) - 1);
-  n.ssid[sizeof(n.ssid) - 1] = '\0';
-  n.rssi    = rssi;
-  n.channel = channel;
-  const uint8_t addr[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, id};
-  memcpy(n.bssid, addr, 6);
-}
-
-void loadTestNetworks() {
-  netCount = 0;
-  addTestNet("HomeNet",                          -45,  6, 1);
-  addTestNet("HomeNet",                          -58, 11, 2);
-  addTestNet("Neighbor_WiFi",                    -67,  1, 3);
-  addTestNet("CoffeeShop_Guest",                 -74,  6, 4);
-  addTestNet("",                                 -79, 11, 5);   // hidden
-  addTestNet("",                                 -83,  1, 6);   // hidden
-  addTestNet("A_Very_Long_Network_Name_Test_32", -86,  3, 7);
-  addTestNet("xfinitywifi",                      -88,  6, 8);
-}
 
 // Text to show for a network's name. The name is used exactly as broadcast;
 // characters the OLED font can't draw (emoji, accents) show as '?'.
@@ -169,6 +146,65 @@ void buildNetLabels() {
     if (total > 1) snprintf(netLabels[i], sizeof(netLabels[i]), "%.15s (%d)", name, order);
     else           snprintf(netLabels[i], sizeof(netLabels[i]), "%.20s", name);
   }
+}
+
+// ---------- Scanning ----------
+// Starts a background scan (the buttons keep working while it runs).
+void startScan() {
+  netCount = 0;
+  netState.cursor = 0;
+  netState.scroll = 0;
+
+  if (!scanning) {                     // if one is still running (you left and came back), just wait for it
+    WiFi.scanDelete();                 // clear old results
+    WiFi.scanNetworks(true, true);     // async = true, include hidden networks
+    scanning = true;
+  }
+}
+
+// Call from loop(). Returns true when a scan has just finished.
+// Keeps the strongest MAX_NETS networks, sorted strongest first.
+bool checkScan() {
+  int n = WiFi.scanComplete();
+  if (n == WIFI_SCAN_RUNNING) return false;
+
+  scanning = false;
+  netCount = 0;
+
+  for (int i = 0; i < n; i++) {        // n is negative if the scan failed, so this is skipped
+    int rssi = WiFi.RSSI(i);
+    if (netCount == MAX_NETS && rssi <= nets[MAX_NETS - 1].rssi) continue;
+
+    // Find this network's place in the sorted list (strongest first)
+    int pos = (netCount < MAX_NETS) ? netCount : MAX_NETS - 1;
+    while (pos > 0 && nets[pos - 1].rssi < rssi) {
+      nets[pos] = nets[pos - 1];
+      pos--;
+    }
+
+    String name = WiFi.SSID(i);        // empty for a hidden network
+    strncpy(nets[pos].ssid, name.c_str(), sizeof(nets[pos].ssid) - 1);
+    nets[pos].ssid[sizeof(nets[pos].ssid) - 1] = '\0';
+    nets[pos].rssi    = rssi;
+    nets[pos].channel = WiFi.channel(i);
+    memcpy(nets[pos].bssid, WiFi.BSSID(i), 6);
+    if (netCount < MAX_NETS) netCount++;
+  }
+
+  WiFi.scanDelete();
+  buildNetLabels();
+
+  Serial.print("Scan done: ");
+  Serial.print(netCount);
+  Serial.println(" networks");
+  for (int i = 0; i < netCount; i++) {
+    Serial.print(nets[i].ssid);
+    Serial.print("  ");
+    Serial.print(nets[i].rssi);
+    Serial.print(" dBm  ch ");
+    Serial.println(nets[i].channel);
+  }
+  return true;
 }
 
 // ---------- Button events ----------
@@ -229,7 +265,7 @@ void moveList(ListState &st, int count, int dir) {
 }
 
 // Header in the yellow band, up to 4 rows in the blue area, scrollbar if the list is longer
-void drawList(const char* header, int count, const ListState &st, LabelFn label) {
+void drawList(const char* header, int count, const ListState &st, LabelFn label, const char* emptyText) {
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
@@ -239,7 +275,7 @@ void drawList(const char* header, int count, const ListState &st, LabelFn label)
 
   if (count <= 0) {
     display.setCursor(4, 30);
-    display.print("Nothing here");
+    display.print(emptyText);
     display.display();
     return;
   }
@@ -348,17 +384,21 @@ void draw() {
   char header[24];
   switch (currentScreen) {
     case SCREEN_MENU:
-      drawList("MENU", MENU_COUNT, menuState, menuLabel);
+      drawList("MENU", MENU_COUNT, menuState, menuLabel, "Nothing here");
       break;
     case SCREEN_NETWORKS:
-      snprintf(header, sizeof(header), "Networks: %d", netCount);
-      drawList(header, netCount, netState, netLabel);
+      if (scanning) {
+        drawList("Scanning...", 0, netState, netLabel, "Please wait");
+      } else {
+        snprintf(header, sizeof(header), "Networks: %d", netCount);
+        drawList(header, netCount, netState, netLabel, "No networks found");
+      }
       break;
     case SCREEN_DETAILS:
       drawDetails();
       break;
     case SCREEN_OPTIONS:
-      drawList(selectedLabel, OPTION_COUNT, optState, optionLabel);
+      drawList(selectedLabel, OPTION_COUNT, optState, optionLabel, "Nothing here");
       break;
     case SCREEN_LIVE:     drawToolPlaceholder(OPTION_ITEMS[0]); break;
     case SCREEN_CHANNEL:  drawToolPlaceholder(OPTION_ITEMS[1]); break;
@@ -388,7 +428,7 @@ void handleEvent(ButtonEvent evt) {
       if (evt == EVT_DOWN)   moveList(menuState, MENU_COUNT, +1);
       if (evt == EVT_SELECT) {
         currentScreen = MENU_TARGETS[menuState.cursor];
-        // Later: start the real WiFi scan here when entering SCREEN_NETWORKS
+        if (currentScreen == SCREEN_NETWORKS) startScan();   // scan on entry
       }
       break;
 
@@ -433,12 +473,16 @@ void setup() {
 
   for (int i = 0; i < 3; i++) pinMode(BTN_PINS[i], INPUT_PULLUP);
 
-  loadTestNetworks();
-  buildNetLabels();
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
   draw();
 }
 
 void loop() {
   ButtonEvent evt = readButtons();
   if (evt != EVT_NONE) handleEvent(evt);
+
+  // The scan runs in the background; redraw the list when the results arrive
+  if (scanning && checkScan() && currentScreen == SCREEN_NETWORKS) draw();
 }
