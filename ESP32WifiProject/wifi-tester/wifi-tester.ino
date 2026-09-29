@@ -1,4 +1,4 @@
-// ESP32 WiFi Tester - Step 8: Latency screen
+// ESP32 WiFi Tester - Step 9: Activity screen
 //
 // Navigation tree:
 //   MENU
@@ -8,7 +8,7 @@
 //                  ├─ Live Signal   (dBm, grade, bar graph - updates continuously)
 //                  ├─ Channel & Congestion (channel, loss, congestion, device list)
 //                  ├─ Latency
-//                  └─ Activity      (Latency and Activity are placeholders for now)
+//                  └─ Activity      (name, channel, traffic grade, live bar, packets, pps)
 //
 // Controls:
 //   UP / DOWN         : move the highlight (wraps around)
@@ -176,6 +176,19 @@ ListState devState = {0, 0};
 float airtimePct = 0;              // channel busy time, percent
 float lossPct    = 0;              // retransmission rate on the chosen network, percent
 bool  lossKnown  = false;
+
+// ---------- Activity (sniffer) state ----------
+// Packet counts are data frames belonging to the chosen network (same matching
+// as Channel & Congestion). The bar and pps use a rolling window plus the
+// second currently being filled, so the graph keeps moving between 1 s ticks.
+const float ACT_LOW_MAX = 10.0f;    // pps below this = Low
+const float ACT_MED_MAX = 40.0f;    // below this = Medium, otherwise High
+const float ACT_BAR_MAX = 80.0f;    // pps that fills the bar completely
+const uint32_t ACTIVITY_REDRAW_MS = 200;
+
+uint32_t activityPackets = 0;       // total data frames since the screen opened
+float    activityPps     = 0;       // live packets/sec on the chosen network
+unsigned long lastActivityDrawMs = 0;
 
 // Text to show for a network's name. The name is used exactly as broadcast;
 // characters the OLED font can't draw (emoji, accents) show as '?'.
@@ -403,6 +416,7 @@ void handleFrame(const uint8_t *f, uint32_t sigLen, uint32_t airtimeUs) {
   if (ours) {
     buckets[curBucket].dataFrames++;
     if (f[1] & 0x08) buckets[curBucket].retryFrames++;   // retry bit
+    activityPackets++;
   }
 
   // Skip group/broadcast addresses and the access point itself
@@ -436,12 +450,15 @@ void resetSniffStats() {
   curBucket     = 0;
   bucketsFilled = 0;
   deviceCount   = 0;
+  activityPackets = 0;
   portEXIT_CRITICAL(&sniffMux);
 
   bucketStartMs = millis();
   airtimePct    = 0;
   lossPct       = 0;
   lossKnown     = false;
+  activityPps   = 0;
+  lastActivityDrawMs = 0;
   devSnapCount  = 0;
   devState.cursor = 0;
   devState.scroll = 0;
@@ -515,6 +532,36 @@ const char* congestionGrade(float airtimePercent) {
   return "Heavy";
 }
 
+const char* activityGrade(float pps) {
+  if (pps < ACT_LOW_MAX) return "Low";
+  if (pps < ACT_MED_MAX) return "Medium";
+  return "High";
+}
+
+// Live packets/sec: completed 1 s buckets plus the second still filling.
+void snapshotActivity() {
+  uint32_t windowPackets = 0;
+  int filled;
+  unsigned long now = millis();
+
+  portENTER_CRITICAL(&sniffMux);
+  filled = bucketsFilled;
+  for (int k = 1; k <= filled; k++) {
+    int idx = (curBucket - k + SNIFF_RING) % SNIFF_RING;
+    windowPackets += buckets[idx].dataFrames;
+  }
+  windowPackets += buckets[curBucket].dataFrames;
+  portEXIT_CRITICAL(&sniffMux);
+
+  float elapsed = (float)filled + (float)(now - bucketStartMs) / (float)BUCKET_MS;
+  if (elapsed < 0.20f) {
+    activityPps = 0;
+    return;
+  }
+  if (elapsed > (float)(SNIFF_WINDOW_S + 1)) elapsed = (float)(SNIFF_WINDOW_S + 1);
+  activityPps = (float)windowPackets / elapsed;
+}
+
 // Call from loop(). Returns true when the screen needs a redraw.
 bool pumpScan() {
   if (scanKind != SCAN_NONE) {
@@ -535,7 +582,9 @@ bool pumpScan() {
   // Nothing running: start whatever is wanted
   if (wantListScan) beginListScan();
   else if (currentScreen == SCREEN_LIVE) beginLiveScan();
-  else if (currentScreen == SCREEN_CHANNEL && !sniffing) startSniff();   // starts once the radio is free
+  else if ((currentScreen == SCREEN_CHANNEL || currentScreen == SCREEN_ACTIVITY) && !sniffing) {
+    startSniff();   // starts once the radio is free
+  }
   return false;
 }
 
@@ -843,6 +892,66 @@ void drawChannel() {
   display.display();
 }
 
+// ---------- Activity screen ----------
+// Header: network name. Then channel + qualitative traffic, a live horizontal
+// bar of packets/sec, the running packet total, and the current rate.
+const int ACT_BAR_X = 4;
+const int ACT_BAR_W = 120;
+const int ACT_BAR_Y = 32;
+const int ACT_BAR_H = 12;
+const float ACT_DIVIDERS[2] = {ACT_LOW_MAX, ACT_MED_MAX};
+
+int activityBarX(float pps) {
+  if (pps < 0) pps = 0;
+  if (pps > ACT_BAR_MAX) pps = ACT_BAR_MAX;
+  return ACT_BAR_X + (int)lroundf(pps * (float)ACT_BAR_W / ACT_BAR_MAX);
+}
+
+void drawActivity() {
+  snapshotActivity();
+
+  uint32_t total;
+  portENTER_CRITICAL(&sniffMux);
+  total = activityPackets;
+  portEXIT_CRITICAL(&sniffMux);
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 4);
+  display.print(selectedLabel);
+
+  char line[24];
+  snprintf(line, sizeof(line), "ch %d", selectedNet.channel);
+  display.setCursor(0, 18);
+  display.print(line);
+
+  bool warming = (millis() - bucketStartMs < 200 && bucketsFilled == 0);
+  const char* grade = warming ? "..." : activityGrade(activityPps);
+  display.setCursor(SCREEN_WIDTH - (int)strlen(grade) * 6, 18);
+  display.print(grade);
+
+  int fillEnd = warming ? ACT_BAR_X : activityBarX(activityPps);
+  display.drawRect(ACT_BAR_X, ACT_BAR_Y, ACT_BAR_W + 1, ACT_BAR_H, SSD1306_WHITE);
+  display.fillRect(ACT_BAR_X, ACT_BAR_Y, fillEnd - ACT_BAR_X + 1, ACT_BAR_H, SSD1306_WHITE);
+
+  for (int i = 0; i < 2; i++) {
+    display.drawFastVLine(activityBarX(ACT_DIVIDERS[i]), ACT_BAR_Y - 3, ACT_BAR_H + 6, SSD1306_INVERSE);
+  }
+
+  snprintf(line, sizeof(line), "Packets: %lu", (unsigned long)total);
+  display.setCursor(0, 48);
+  display.print(line);
+
+  if (warming) snprintf(line, sizeof(line), "Rate: -- pps");
+  else         snprintf(line, sizeof(line), "Rate: %d pps", (int)lroundf(activityPps));
+  display.setCursor(0, 56);
+  display.print(line);
+
+  display.display();
+}
+
 // Shown when a scan finishes with nothing found
 void drawNoNetworks() {
   display.clearDisplay();
@@ -1139,7 +1248,7 @@ void draw() {
     case SCREEN_LIVE:     drawLive(); break;
     case SCREEN_CHANNEL:  drawChannel(); break;
     case SCREEN_LATENCY:  drawLatency(); break;
-    case SCREEN_ACTIVITY: drawToolPlaceholder(OPTION_ITEMS[3]); break;
+    case SCREEN_ACTIVITY: drawActivity(); break;
   }
 }
 
@@ -1195,6 +1304,7 @@ void handleEvent(ButtonEvent evt) {
         if (currentScreen == SCREEN_LIVE) resetLive();
         if (currentScreen == SCREEN_CHANNEL) resetSniffStats();
         if (currentScreen == SCREEN_LATENCY) startLatency();
+        if (currentScreen == SCREEN_ACTIVITY) resetSniffStats();
       }
       if (evt == EVT_BACK)   currentScreen = SCREEN_DETAILS;
       break;
@@ -1202,6 +1312,13 @@ void handleEvent(ButtonEvent evt) {
     case SCREEN_CHANNEL:
       if (evt == EVT_UP)   moveListRows(devState, devSnapCount, -1, CH_VISIBLE);
       if (evt == EVT_DOWN) moveListRows(devState, devSnapCount, +1, CH_VISIBLE);
+      if (evt == EVT_BACK) {
+        stopSniff();
+        currentScreen = SCREEN_OPTIONS;
+      }
+      break;
+
+    case SCREEN_ACTIVITY:
       if (evt == EVT_BACK) {
         stopSniff();
         currentScreen = SCREEN_OPTIONS;
@@ -1253,4 +1370,14 @@ void loop() {
 
   // Channel & Congestion: refresh the numbers once a second
   if (currentScreen == SCREEN_CHANNEL && sniffing && sniffTick()) draw();
+
+  // Activity: close 1 s buckets and redraw often so the bar stays live
+  if (currentScreen == SCREEN_ACTIVITY && sniffing) {
+    sniffTick();
+    unsigned long now = millis();
+    if (now - lastActivityDrawMs >= ACTIVITY_REDRAW_MS) {
+      lastActivityDrawMs = now;
+      draw();
+    }
+  }
 }
