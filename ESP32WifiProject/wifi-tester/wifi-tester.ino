@@ -1,17 +1,18 @@
-// ESP32 WiFi Tester - Step 4 (rebuilt): menu architecture
+// ESP32 WiFi Tester - Step 4 (v2): menu architecture with network details
 //
 // Navigation tree:
 //   MENU
-//   └─ WiFi Scanner  -> NETWORKS (list of network names)
-//        └─ [network] -> OPTIONS
-//             ├─ Live Signal
-//             ├─ Channel & Congestion
-//             ├─ Latency
-//             └─ Activity      (each is a placeholder for now)
+//   └─ WiFi Scanner -> NETWORKS (names as broadcast, "(n)" marker if names collide)
+//        └─ [network] -> DETAILS (full name, BSSID, channel, signal)
+//             └─ OPTIONS
+//                  ├─ Live Signal
+//                  ├─ Channel & Congestion
+//                  ├─ Latency
+//                  └─ Activity      (each is a placeholder for now)
 //
 // Controls:
 //   UP / DOWN         : move the highlight (wraps around)
-//   SELECT (short)    : open the highlighted item
+//   SELECT (short)    : open the highlighted item / continue
 //   SELECT (hold 1 s) : go back one level
 //
 // The network list uses TEST DATA (no WiFi code yet). It will be replaced
@@ -38,25 +39,17 @@ const uint8_t PIN_SELECT = 27;
 #define DEBOUNCE_MS   30
 #define LONG_PRESS_MS 1000
 
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-
-// ---------- Layout ----------
-const int BLUE_TOP     = 16;   // first blue row
-const int ROW_H        = 12;
-const int VISIBLE_ROWS = 4;    // 4 x 12 = 48 rows of blue
-const int LIST_W       = 124;  // highlight width (leaves room for the scrollbar)
-
 // ---------- Types ----------
 // Arduino inserts function prototypes above the first function in the file,
 // so every type used in a function signature must be defined up here.
 enum ButtonEvent { EVT_NONE, EVT_UP, EVT_DOWN, EVT_SELECT, EVT_BACK };
 
-typedef const char* (*LabelFn)(int);   // a function that returns the text for list row i
+typedef const char* (*LabelFn)(int);   // returns the text for list row i
 
-// ---------- Screens ----------
 enum Screen {
   SCREEN_MENU,
   SCREEN_NETWORKS,
+  SCREEN_DETAILS,
   SCREEN_OPTIONS,
   SCREEN_LIVE,
   SCREEN_CHANNEL,
@@ -64,6 +57,27 @@ enum Screen {
   SCREEN_ACTIVITY
 };
 
+struct ListState {
+  int cursor;   // highlighted item
+  int scroll;   // first visible item
+};
+
+struct Net {
+  char    ssid[33];   // exactly as broadcast (empty for a hidden network)
+  int32_t rssi;
+  uint8_t channel;
+  uint8_t bssid[6];   // unique hardware address: how networks are told apart internally
+};
+
+// ---------- Display and layout ----------
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+const int BLUE_TOP     = 16;   // first blue row
+const int ROW_H        = 12;
+const int VISIBLE_ROWS = 4;    // 4 x 12 = 48 rows of blue
+const int LIST_W       = 124;  // highlight width (leaves room for the scrollbar)
+
+// ---------- Menus ----------
 Screen currentScreen = SCREEN_MENU;
 
 // Main menu: add future features here (keep the two arrays in step)
@@ -71,16 +85,10 @@ const int MENU_COUNT = 1;
 const char* MENU_ITEMS[MENU_COUNT]    = {"WiFi Scanner"};
 const Screen MENU_TARGETS[MENU_COUNT] = {SCREEN_NETWORKS};
 
-// Options shown after picking a network
+// Options shown after the details screen
 const int OPTION_COUNT = 4;
 const char* OPTION_ITEMS[OPTION_COUNT]    = {"Live Signal", "Channel & Congestion", "Latency", "Activity"};
 const Screen OPTION_TARGETS[OPTION_COUNT] = {SCREEN_LIVE, SCREEN_CHANNEL, SCREEN_LATENCY, SCREEN_ACTIVITY};
-
-// ---------- List state (one per list) ----------
-struct ListState {
-  int cursor;   // highlighted item
-  int scroll;   // first visible item
-};
 
 ListState menuState = {0, 0};
 ListState netState  = {0, 0};
@@ -89,23 +97,20 @@ ListState optState  = {0, 0};
 // ---------- Networks ----------
 const int MAX_NETS = 20;
 
-struct Net {
-  char    ssid[33];
-  int32_t rssi;
-  uint8_t channel;
-  uint8_t bssid[6];   // unique hardware address: how networks are told apart internally
-};
+Net  nets[MAX_NETS];
+int  netCount = 0;
 
-Net nets[MAX_NETS];
-int netCount = 0;
-
-char netLabels[MAX_NETS][24];   // what the list shows (name, plus "(n)" if names collide)
+char netLabels[MAX_NETS][24];   // list text: name, plus " (n)" if the name appears more than once
+int  netOrder[MAX_NETS];        // this network's position among same-name networks (1, 2, ...)
+int  netTotal[MAX_NETS];        // how many networks share this name
 
 Net  selectedNet;
 char selectedLabel[24] = "";
+int  selectedOrder = 1;
+int  selectedTotal = 1;
 
-// TEST DATA: includes a mesh pair with the same name, two hidden networks,
-// and a long name, so the labeling and scrolling can be checked.
+// TEST DATA: a mesh pair with the same name, two hidden networks (empty name
+// on the air), and a maximum-length 32-character name.
 void addTestNet(const char* ssid, int rssi, uint8_t channel, uint8_t id) {
   if (netCount >= MAX_NETS) return;
   Net &n = nets[netCount++];
@@ -119,18 +124,35 @@ void addTestNet(const char* ssid, int rssi, uint8_t channel, uint8_t id) {
 
 void loadTestNetworks() {
   netCount = 0;
-  addTestNet("HomeNet",                    -45,  6, 1);
-  addTestNet("HomeNet",                    -58, 11, 2);
-  addTestNet("Neighbor_WiFi",              -67,  1, 3);
-  addTestNet("CoffeeShop_Guest",           -74,  6, 4);
-  addTestNet("(hidden)",                   -79, 11, 5);
-  addTestNet("(hidden)",                   -83,  1, 6);
-  addTestNet("A_Very_Long_Network_Name_2", -86,  3, 7);
-  addTestNet("xfinitywifi",                -88,  6, 8);
+  addTestNet("HomeNet",                          -45,  6, 1);
+  addTestNet("HomeNet",                          -58, 11, 2);
+  addTestNet("Neighbor_WiFi",                    -67,  1, 3);
+  addTestNet("CoffeeShop_Guest",                 -74,  6, 4);
+  addTestNet("",                                 -79, 11, 5);   // hidden
+  addTestNet("",                                 -83,  1, 6);   // hidden
+  addTestNet("A_Very_Long_Network_Name_Test_32", -86,  3, 7);
+  addTestNet("xfinitywifi",                      -88,  6, 8);
+}
+
+// Text to show for a network's name. The name is used exactly as broadcast;
+// characters the OLED font can't draw (emoji, accents) show as '?'.
+// A hidden network broadcasts an empty name, so it is shown as "(hidden)".
+void displayName(const Net &n, char *out, size_t outSize) {
+  if (n.ssid[0] == '\0') {
+    snprintf(out, outSize, "(hidden)");
+    return;
+  }
+  size_t i = 0;
+  for (; i < outSize - 1 && n.ssid[i] != '\0'; i++) {
+    unsigned char c = (unsigned char)n.ssid[i];
+    out[i] = (c >= 32 && c <= 126) ? (char)c : '?';
+  }
+  out[i] = '\0';
 }
 
 // Same name more than once -> "Name (1)", "Name (2)" ...; otherwise just the name.
 void buildNetLabels() {
+  char name[33];
   for (int i = 0; i < netCount; i++) {
     int total = 0;
     int order = 0;
@@ -140,8 +162,12 @@ void buildNetLabels() {
         if (j <= i) order++;
       }
     }
-    if (total > 1) snprintf(netLabels[i], sizeof(netLabels[i]), "%.15s (%d)", nets[i].ssid, order);
-    else           snprintf(netLabels[i], sizeof(netLabels[i]), "%.20s", nets[i].ssid);
+    netTotal[i] = total;
+    netOrder[i] = order;
+
+    displayName(nets[i], name, sizeof(name));
+    if (total > 1) snprintf(netLabels[i], sizeof(netLabels[i]), "%.15s (%d)", name, order);
+    else           snprintf(netLabels[i], sizeof(netLabels[i]), "%.20s", name);
   }
 }
 
@@ -246,6 +272,54 @@ void drawList(const char* header, int count, const ListState &st, LabelFn label)
 }
 
 // ---------- Drawing ----------
+// Full name (wrapped over two lines), BSSID, channel and signal for the chosen network
+void drawDetails() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  // Header (yellow): shows which of several same-name networks this is
+  display.setCursor(0, 4);
+  display.print("Details");
+  if (selectedTotal > 1) {
+    display.print(" (");
+    display.print(selectedOrder);
+    display.print(")");
+  }
+
+  // Name: 21 characters per line, up to 32 characters total
+  char name[33];
+  displayName(selectedNet, name, sizeof(name));
+
+  char line[22];
+  snprintf(line, sizeof(line), "%.21s", name);
+  display.setCursor(0, 18);
+  display.print(line);
+
+  display.setCursor(0, 27);
+  if (selectedNet.ssid[0] == '\0') {
+    display.print("name not broadcast");
+  } else if (strlen(name) > 21) {
+    snprintf(line, sizeof(line), "%.21s", name + 21);
+    display.print(line);
+  }
+
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+           selectedNet.bssid[0], selectedNet.bssid[1], selectedNet.bssid[2],
+           selectedNet.bssid[3], selectedNet.bssid[4], selectedNet.bssid[5]);
+  display.setCursor(0, 36);
+  display.print(buf);
+
+  snprintf(buf, sizeof(buf), "ch %d    %d dBm", selectedNet.channel, (int)selectedNet.rssi);
+  display.setCursor(0, 45);
+  display.print(buf);
+
+  display.setCursor(0, 54);
+  display.print("SELECT: continue");
+  display.display();
+}
+
 void drawToolPlaceholder(const char* title) {
   display.clearDisplay();
   display.setTextSize(1);
@@ -280,6 +354,9 @@ void draw() {
       snprintf(header, sizeof(header), "Networks: %d", netCount);
       drawList(header, netCount, netState, netLabel);
       break;
+    case SCREEN_DETAILS:
+      drawDetails();
+      break;
     case SCREEN_OPTIONS:
       drawList(selectedLabel, OPTION_COUNT, optState, optionLabel);
       break;
@@ -293,13 +370,15 @@ void draw() {
 // ---------- Logic ----------
 void selectNetwork() {
   if (netCount == 0) return;
-  selectedNet = nets[netState.cursor];
-  strncpy(selectedLabel, netLabels[netState.cursor], sizeof(selectedLabel) - 1);
+  int i = netState.cursor;
+
+  selectedNet   = nets[i];
+  selectedOrder = netOrder[i];
+  selectedTotal = netTotal[i];
+  strncpy(selectedLabel, netLabels[i], sizeof(selectedLabel) - 1);
   selectedLabel[sizeof(selectedLabel) - 1] = '\0';
 
-  optState.cursor = 0;
-  optState.scroll = 0;
-  currentScreen = SCREEN_OPTIONS;
+  currentScreen = SCREEN_DETAILS;
 }
 
 void handleEvent(ButtonEvent evt) {
@@ -320,11 +399,20 @@ void handleEvent(ButtonEvent evt) {
       if (evt == EVT_BACK)   currentScreen = SCREEN_MENU;
       break;
 
+    case SCREEN_DETAILS:
+      if (evt == EVT_SELECT) {
+        optState.cursor = 0;
+        optState.scroll = 0;
+        currentScreen = SCREEN_OPTIONS;
+      }
+      if (evt == EVT_BACK)   currentScreen = SCREEN_NETWORKS;
+      break;
+
     case SCREEN_OPTIONS:
       if (evt == EVT_UP)     moveList(optState, OPTION_COUNT, -1);
       if (evt == EVT_DOWN)   moveList(optState, OPTION_COUNT, +1);
       if (evt == EVT_SELECT) currentScreen = OPTION_TARGETS[optState.cursor];
-      if (evt == EVT_BACK)   currentScreen = SCREEN_NETWORKS;
+      if (evt == EVT_BACK)   currentScreen = SCREEN_DETAILS;
       break;
 
     default:   // the four tool screens
