@@ -1,7 +1,7 @@
-// ESP32 WiFi Tester - Step 10: Power on/off, welcome, power-off confirm
+// ESP32 WiFi Tester - Step 12: power is the hardware switch only
 //
 // Navigation tree:
-//   OFF (blank) -- short SELECT --> WELCOME (2 s) --> MENU
+//   Power switch on --> WELCOME (2 s) --> MENU
 //   MENU
 //   ├─ WiFi Scanner -> NETWORKS (names as broadcast, "(n)" marker if names collide)
 //   │    └─ [network] -> DETAILS (full name, BSSID, channel, signal)
@@ -10,11 +10,10 @@
 //   │              ├─ Channel & Congestion (channel, loss, congestion, device list)
 //   │              ├─ Latency
 //   │              └─ Activity      (name, channel, traffic grade, live bar, packets, pps)
-//   └─ Power Off -> confirm (Yes: SELECT, No: DOWN) -> power-off screen -> OFF
 //
 // Controls:
 //   UP / DOWN         : move the highlight (wraps around)
-//   SELECT (short)    : open the highlighted item / continue / power on from OFF
+//   SELECT (short)    : open the highlighted item / continue
 //   SELECT (hold 1 s) : go back one level
 //
 // The network list comes from a real 2.4 GHz WiFi scan, strongest signal first.
@@ -54,10 +53,7 @@ typedef const char* (*LabelFn)(int);   // returns the text for list row i
 enum ScanKind { SCAN_NONE, SCAN_LIST, SCAN_LIVE };   // which WiFi scan is running
 
 enum Screen {
-  SCREEN_OFF,
   SCREEN_WELCOME,
-  SCREEN_POWER_CONFIRM,
-  SCREEN_POWER_OFF,
   SCREEN_MENU,
   SCREEN_NETWORKS,
   SCREEN_DETAILS,
@@ -96,16 +92,15 @@ const int VISIBLE_ROWS = 4;    // 4 x 12 = 48 rows of blue
 const int LIST_W       = 124;  // highlight width (leaves room for the scrollbar)
 
 // ---------- Menus ----------
-Screen currentScreen = SCREEN_OFF;   // boots dark; short SELECT turns the tool on
+Screen currentScreen = SCREEN_WELCOME;   // boots into the welcome screen, then the menu
 
 // Main menu: add future features here (keep the two arrays in step)
-const int MENU_COUNT = 2;
-const char* MENU_ITEMS[MENU_COUNT]    = {"WiFi Scanner", "Power Off"};
-const Screen MENU_TARGETS[MENU_COUNT] = {SCREEN_NETWORKS, SCREEN_POWER_CONFIRM};
+const int MENU_COUNT = 1;
+const char* MENU_ITEMS[MENU_COUNT]    = {"WiFi Scanner"};
+const Screen MENU_TARGETS[MENU_COUNT] = {SCREEN_NETWORKS};
 
 const uint32_t WELCOME_MS   = 2000;   // welcome screen before the menu
-const uint32_t POWER_OFF_MS = 1500;   // goodbye screen before the display blanks
-unsigned long screenEnterMs = 0;      // when WELCOME or POWER_OFF started
+unsigned long screenEnterMs = 0;      // when the welcome screen started
 
 // Options shown after the details screen
 const int OPTION_COUNT = 4;
@@ -574,8 +569,7 @@ void snapshotActivity() {
 
 // Call from loop(). Returns true when the screen needs a redraw.
 bool pumpScan() {
-  if (currentScreen == SCREEN_OFF || currentScreen == SCREEN_WELCOME ||
-      currentScreen == SCREEN_POWER_CONFIRM || currentScreen == SCREEN_POWER_OFF) {
+  if (currentScreen == SCREEN_WELCOME) {
     return false;
   }
 
@@ -1238,38 +1232,12 @@ void drawToolPlaceholder(const char* title) {
   display.display();
 }
 
-// ---------- Power on / off ----------
-void stopRadioWork() {
-  wantListScan = false;
-  if (scanKind != SCAN_NONE) {
-    WiFi.scanDelete();
-    scanKind = SCAN_NONE;
-  }
-  stopSniff();
-  stopLatency();
-}
-
-void enterOffState() {
-  stopRadioWork();
-  currentScreen = SCREEN_OFF;
-  menuState.cursor = 0;
-  menuState.scroll = 0;
-  display.clearDisplay();
-  display.display();
-  display.ssd1306_command(SSD1306_DISPLAYOFF);
-}
-
+// ---------- Welcome screen ----------
 void startWelcome() {
-  display.ssd1306_command(SSD1306_DISPLAYON);
   currentScreen = SCREEN_WELCOME;
   screenEnterMs = millis();
   menuState.cursor = 0;
   menuState.scroll = 0;
-}
-
-void drawOff() {
-  display.clearDisplay();
-  display.display();
 }
 
 void drawWelcome() {
@@ -1287,52 +1255,11 @@ void drawWelcome() {
   display.display();
 }
 
-void drawPowerConfirm() {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-
-  display.setCursor(0, 4);
-  display.print("Power Off");
-
-  display.setCursor(0, 22);
-  display.print("Power Off?");
-  display.setCursor(0, 38);
-  display.print("Yes: SELECT");
-  display.setCursor(0, 50);
-  display.print("No: DOWN");
-  display.display();
-}
-
-void drawPowerOff() {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-
-  display.setCursor(0, 4);
-  display.print("Power Off");
-
-  display.setCursor(0, 26);
-  display.print("Powering off...");
-  display.setCursor(0, 42);
-  display.print("Goodbye");
-  display.display();
-}
-
 void draw() {
   char header[24];
   switch (currentScreen) {
-    case SCREEN_OFF:
-      drawOff();
-      break;
     case SCREEN_WELCOME:
       drawWelcome();
-      break;
-    case SCREEN_POWER_CONFIRM:
-      drawPowerConfirm();
-      break;
-    case SCREEN_POWER_OFF:
-      drawPowerOff();
       break;
     case SCREEN_MENU:
       drawList("MENU", MENU_COUNT, menuState, menuLabel, "Nothing here");
@@ -1376,21 +1303,8 @@ void selectNetwork() {
 
 void handleEvent(ButtonEvent evt) {
   switch (currentScreen) {
-    case SCREEN_OFF:
-      if (evt == EVT_SELECT) startWelcome();
-      break;
-
     case SCREEN_WELCOME:
-    case SCREEN_POWER_OFF:
-      break;
-
-    case SCREEN_POWER_CONFIRM:
-      if (evt == EVT_SELECT) {
-        currentScreen = SCREEN_POWER_OFF;
-        screenEnterMs = millis();
-      }
-      if (evt == EVT_DOWN || evt == EVT_BACK) currentScreen = SCREEN_MENU;
-      break;
+      break;   // buttons do nothing during the welcome screen
 
     case SCREEN_MENU:
       if (evt == EVT_UP)     moveList(menuState, MENU_COUNT, -1);
@@ -1482,7 +1396,8 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
 
-  enterOffState();
+  startWelcome();   // switching on goes straight to the welcome screen
+  draw();
 }
 
 void loop() {
@@ -1492,9 +1407,6 @@ void loop() {
   if (currentScreen == SCREEN_WELCOME && (millis() - screenEnterMs) >= WELCOME_MS) {
     currentScreen = SCREEN_MENU;
     draw();
-  }
-  if (currentScreen == SCREEN_POWER_OFF && (millis() - screenEnterMs) >= POWER_OFF_MS) {
-    enterOffState();
   }
 
   // Scans run in the background; redraw when new results arrive
